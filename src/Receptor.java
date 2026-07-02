@@ -2,11 +2,22 @@ import java.io.*;
 import java.net.*;
 import java.security.*;
 
+/**
+ * Lado receptor do protocolo Go-Back-N sobre UDP.
+ *
+ * Diferente do Emissor, o Receptor é "burro" de propósito: não tem buffer para
+ * pacotes fora de ordem. Ele só aceita o pacote cujo numSeq é exatamente o esperado
+ * (expectedSeqNum); qualquer outra coisa é descartada e o último ACK válido é
+ * reenviado. É essa simplicidade no Receptor que obriga o Emissor a reenviar a
+ * janela inteira em caso de perda — a marca registrada do Go-Back-N.
+ */
 public class Receptor {
+    // Tempo que o Receptor continua respondendo a FINs duplicados após o primeiro FIN,
+    // para o caso do FIN-ACK ter se perdido e o Emissor retransmitir o FIN.
     private static final int TIMEOUT_DUPLICATE_FIN_MS = 1000;
 
     private final DatagramSocket socket;
-    private int   maxSeqNum;
+    private int   maxSeqNum; // só é conhecido após o handshake (depende do windowSize do Emissor)
 
     Receptor(int port) throws SocketException {
         this.socket = new DatagramSocket(port);
@@ -18,10 +29,13 @@ public class Receptor {
         new Receptor(port).receive();
     }
 
+    // Orquestra a recepção completa: handshake -> loop de recebimento GBN -> estatísticas
     void receive() throws Exception {
         byte[] buf = new byte[Packet.MAX_PKT];
 
         // ---- Fase 1: Handshake ----
+        // O primeiro datagrama que chegar precisa ser um HANDSHAKE válido; é dele que
+        // vem tudo que o Receptor precisa saber (janela, path de destino, tamanho do arquivo).
         DatagramPacket dp = new DatagramPacket(buf, buf.length);
         socket.receive(dp);
 
@@ -37,7 +51,7 @@ public class Receptor {
         long   fileSize   = info.fileSize;
         int    windowSize = info.windowSize;
         String destPath   = info.destPath;
-        this.maxSeqNum    = windowSize * 2;
+        this.maxSeqNum    = windowSize * 2; // mesma fórmula usada no Emissor, precisa bater
 
         System.out.printf("[HAND] Handshake recebido.%n");
         System.out.printf("[HAND] Destino: %s%n", destPath);
@@ -45,6 +59,7 @@ public class Receptor {
         System.out.printf("[HAND] Janela: %d, maxSeqNum: %d, prob_perda: %.0f%%%n",
                 windowSize, maxSeqNum, lossProb * 100);
 
+        // Guarda endereço/porta do Emissor para responder os ACKs sempre a ele
         InetAddress emissorAddr = dp.getAddress();
         int         emissorPort = dp.getPort();
 
@@ -53,8 +68,8 @@ public class Receptor {
         System.out.println("[HAND] ACK enviado. Aguardando dados GBN...");
 
         // ---- Fase 2: GBN receive loop ----
-        int     expectedSeqNum  = 0;
-        boolean anyReceived     = false;
+        int     expectedSeqNum  = 0;     // único número de sequência que o Receptor aceita agora
+        boolean anyReceived     = false; // ainda não recebemos nada em ordem (evita ACK inválido no início)
         int     acceptCount     = 0;   // pkts aceitos e gravados
         int     lossCount       = 0;   // pkts descartados por simulação de perda
         int     outOfOrderCount = 0;   // pkts descartados por estarem fora de ordem (GBN)
@@ -67,11 +82,12 @@ public class Receptor {
         try (BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(destPath))) {
             while (true) {
                 DatagramPacket incoming = new DatagramPacket(buf, buf.length);
-                socket.receive(incoming);
+                socket.receive(incoming); // bloqueia até chegar o próximo datagrama
 
                 Packet pkt = Packet.deserialize(incoming.getData(), incoming.getLength());
 
-                // Pacote corrompido
+                // Pacote corrompido: descarta e reenvia o último ACK válido para
+                // sinalizar ao Emissor que ainda espera o mesmo seq (gera retransmissão).
                 if (pkt == null || pkt.isCorrupt()) {
                     System.out.println("[DISC ] Pacote corrompido — descartado");
                     if (anyReceived) {
@@ -80,7 +96,8 @@ public class Receptor {
                     continue;
                 }
 
-                // FIN em ordem
+                // FIN em ordem: só aceita o FIN se ele for exatamente o próximo esperado,
+                // senão significa que ainda faltam DATA pendentes.
                 if (pkt.tipo == Packet.TYPE_FIN && pkt.numSeq == expectedSeqNum) {
                     System.out.printf("[FIN  ] Recebido seq=%d%n", pkt.numSeq);
                     bos.flush();
@@ -90,14 +107,16 @@ public class Receptor {
                     break;
                 }
 
-                // DATA em ordem
+                // DATA em ordem: é o único caso em que o Receptor efetivamente progride
                 if (pkt.tipo == Packet.TYPE_DATA && pkt.numSeq == expectedSeqNum) {
-                    // Simulação de perda (README §4): somente em pacotes recebidos em ordem
+                    // Simulação de perda (README §4): somente em pacotes recebidos em ordem,
+                    // para não distorcer a contagem com pacotes que já seriam descartados de qualquer forma.
                     if (Math.random() < lossProb) {
                         lossCount++;
                         System.out.printf("[LOSS ] Perda simulada seq=%d  (total perdas=%d)%n",
                                 pkt.numSeq, lossCount);
                         // Descarta silenciosamente, sem enviar ACK — forçará retransmissão
+                        // (é assim que a "perda" se manifesta para o Emissor: timeout)
                     } else {
                         bos.write(pkt.dados);
                         acceptCount++;
@@ -109,7 +128,9 @@ public class Receptor {
                     continue;
                 }
 
-                // DATA fora de ordem (ou FIN fora de ordem)
+                // DATA fora de ordem (ou FIN fora de ordem): a essência do GBN no receptor —
+                // não há buffer de reordenação, simplesmente descarta e reafirma o último ACK,
+                // o que faz o Emissor estourar o timer e reenviar a janela inteira.
                 if (pkt.tipo == Packet.TYPE_DATA) {
                     outOfOrderCount++;
                     System.out.printf("[DISC ] Fora de ordem: seq=%d (esperado=%d)%n",
@@ -125,7 +146,9 @@ public class Receptor {
         printStats(destPath, acceptCount, lossCount, outOfOrderCount, lossProb, finMD5);
     }
 
-    // Reenvia ACK enquanto chegarem FINs duplicados (aguarda possíveis retransmissões do Emissor)
+    // Reenvia ACK enquanto chegarem FINs duplicados (aguarda possíveis retransmissões do Emissor).
+    // Necessário porque o Receptor já fechou o arquivo e vai sair do loop principal — sem isso,
+    // se o FIN-ACK se perdesse, o Emissor ficaria retransmitindo o FIN sem resposta.
     private void handleDuplicateFins(byte[] buf, InetAddress addr, int port) {
         try {
             socket.setSoTimeout(TIMEOUT_DUPLICATE_FIN_MS);
@@ -138,6 +161,7 @@ public class Receptor {
                 }
             }
         } catch (SocketTimeoutException ignored) {
+            // Ninguém mais retransmitiu FIN dentro do prazo: encerra normalmente.
         } catch (Exception e) {
             e.printStackTrace();
         }
@@ -164,7 +188,8 @@ public class Receptor {
         System.out.printf("Taxa de perda efet.  : %.2f%%  (configurada: %.0f%%)%n",
                 taxaEfetiva, lossProb * 100);
 
-        // Verificação de integridade MD5 (R9)
+        // Verificação de integridade MD5 (R9): prova de ponta a ponta de que o arquivo
+        // chegou idêntico ao original, apesar de perdas/retransmissões pelo caminho.
         if (finMD5 != null) {
             byte[] localMD5 = computeMD5(new File(destPath));
             String localHex = hexString(localMD5);
